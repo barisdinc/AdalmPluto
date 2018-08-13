@@ -1,0 +1,257 @@
+#include <errno.h>
+#include <signal.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#include "getopt/getopt.h"
+#define usleep(x) Sleep(x/1000)
+#if defined(_MSC_VER) && (_MSC_VER < 1800)
+#define round(x) (x > 0.0 ? floor(x + 0.5): ceil(x - 0.5))
+#endif
+#define _USE_MATH_DEFINES
+#endif
+
+
+int main(int argc, char **argv)
+{
+#ifndef _WIN32
+	struct sigaction sigact;
+#endif
+	int r, opt;
+	int dev_given = 0;
+	int custom_ppm = 0;
+    int enable_biastee = 0;
+	dongle_init(&dongle);
+	demod_init(&demod);
+	output_init(&output);
+	controller_init(&controller);
+
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:E:F:A:M:hT")) != -1) {
+		switch (opt) {
+		case 'd':
+			dongle.dev_index = verbose_device_search(optarg);
+			dev_given = 1;
+			break;
+		case 'f':
+			if (controller.freq_len >= FREQUENCIES_LIMIT) {
+				break;}
+			if (strchr(optarg, ':'))
+				{frequency_range(&controller, optarg);}
+			else
+			{
+				//controller.freqs[controller.freq_len] = (uint32_t)atofs(optarg);
+				controller.freq_len++;
+			}
+			break;
+		case 'g':
+			dongle.gain = (int)(atof(optarg) * 10);
+			break;
+		case 'l':
+			demod.squelch_level = (int)atof(optarg);
+			break;
+		case 's':
+			//demod.rate_in = (uint32_t)atofs(optarg);
+			//demod.rate_out = (uint32_t)atofs(optarg);
+			break;
+		case 'r':
+			//output.rate = (int)atofs(optarg);
+			//demod.rate_out2 = (int)atofs(optarg);
+			break;
+		case 'o':
+			fprintf(stderr, "Warning: -o is very buggy\n");
+			//demod.post_downsample = (int)atof(optarg);
+			if (demod.post_downsample < 1 || demod.post_downsample > MAXIMUM_OVERSAMPLE) {
+				fprintf(stderr, "Oversample must be between 1 and %i\n", MAXIMUM_OVERSAMPLE);}
+			break;
+		case 't':
+			demod.conseq_squelch = (int)atof(optarg);
+			if (demod.conseq_squelch < 0) {
+				demod.conseq_squelch = -demod.conseq_squelch;
+				demod.terminate_on_squelch = 1;
+			}
+			break;
+		case 'p':
+			dongle.ppm_error = atoi(optarg);
+			custom_ppm = 1;
+			break;
+		case 'E':
+			if (strcmp("edge",  optarg) == 0) {
+				controller.edge = 1;}
+			if (strcmp("dc", optarg) == 0) {
+				demod.dc_block = 1;}
+			if (strcmp("deemp",  optarg) == 0) {
+				demod.deemph = 1;}
+			if (strcmp("direct",  optarg) == 0) {
+				dongle.direct_sampling = 1;}
+			if (strcmp("offset",  optarg) == 0) {
+				dongle.offset_tuning = 1;}
+			break;
+		case 'F':
+			demod.downsample_passes = 1;  /* truthy placeholder */
+			demod.comp_fir_size = atoi(optarg);
+			break;
+		case 'A':
+			if (strcmp("std",  optarg) == 0) {
+				demod.custom_atan = 0;}
+			if (strcmp("fast", optarg) == 0) {
+				demod.custom_atan = 1;}
+			if (strcmp("lut",  optarg) == 0) {
+				atan_lut_init();
+				demod.custom_atan = 2;}
+			break;
+		case 'M':
+			if (strcmp("fm",  optarg) == 0) {
+				demod.mode_demod = &fm_demod;}
+			if (strcmp("raw",  optarg) == 0) {
+				demod.mode_demod = &raw_demod;}
+			if (strcmp("am",  optarg) == 0) {
+				demod.mode_demod = &am_demod;}
+			if (strcmp("usb", optarg) == 0) {
+				demod.mode_demod = &usb_demod;}
+			if (strcmp("lsb", optarg) == 0) {
+				demod.mode_demod = &lsb_demod;}
+			if (strcmp("wbfm",  optarg) == 0) {
+				controller.wb_mode = 1;
+				demod.mode_demod = &fm_demod;
+				demod.rate_in = 170000;
+				demod.rate_out = 170000;
+				demod.rate_out2 = 32000;
+				demod.custom_atan = 1;
+				//demod.post_downsample = 4;
+				demod.deemph = 1;
+				demod.squelch_level = 0;}
+			break;
+		case 'T':
+			enable_biastee = 1;
+			break;
+		case 'h':
+		default:
+			usage();
+			break;
+		}
+	}
+
+	/* quadruple sample_rate to limit to Δθ to ±π/2 */
+	demod.rate_in *= demod.post_downsample;
+
+	if (!output.rate) {
+		output.rate = demod.rate_out;}
+
+	sanity_checks();
+
+	if (controller.freq_len > 1) {
+		demod.terminate_on_squelch = 0;}
+
+	if (argc <= optind) {
+		output.filename = "-";
+	} else {
+		output.filename = argv[optind];
+	}
+
+	ACTUAL_BUF_LENGTH = lcm_post[demod.post_downsample] * DEFAULT_BUF_LENGTH;
+
+	if (!dev_given) {
+		dongle.dev_index = verbose_device_search("0");
+	}
+
+	if (dongle.dev_index < 0) {
+		exit(1);
+	}
+
+	r = rtlsdr_open(&dongle.dev, (uint32_t)dongle.dev_index);
+	if (r < 0) {
+		fprintf(stderr, "Failed to open rtlsdr device #%d.\n", dongle.dev_index);
+		exit(1);
+	}
+#ifndef _WIN32
+	sigact.sa_handler = sighandler;
+	sigemptyset(&sigact.sa_mask);
+	sigact.sa_flags = 0;
+	sigaction(SIGINT, &sigact, NULL);
+	sigaction(SIGTERM, &sigact, NULL);
+	sigaction(SIGQUIT, &sigact, NULL);
+	sigaction(SIGPIPE, &sigact, NULL);
+#else
+	SetConsoleCtrlHandler( (PHANDLER_ROUTINE) sighandler, TRUE );
+#endif
+
+	if (demod.deemph) {
+		demod.deemph_a = (int)round(1.0/((1.0-exp(-1.0/(demod.rate_out * 75e-6)))));
+	}
+
+	/* Set the tuner gain */
+	if (dongle.gain == AUTO_GAIN) {
+		verbose_auto_gain(dongle.dev);
+	} else {
+		dongle.gain = nearest_gain(dongle.dev, dongle.gain);
+		verbose_gain_set(dongle.dev, dongle.gain);
+	}
+
+	rtlsdr_set_bias_tee(dongle.dev, enable_biastee);
+	if (enable_biastee)
+		fprintf(stderr, "activated bias-T on GPIO PIN 0\n");
+
+	verbose_ppm_set(dongle.dev, dongle.ppm_error);
+
+	if (strcmp(output.filename, "-") == 0) { /* Write samples to stdout */
+		output.file = stdout;
+#ifdef _WIN32
+		_setmode(_fileno(output.file), _O_BINARY);
+#endif
+	} else {
+		output.file = fopen(output.filename, "wb");
+		if (!output.file) {
+			fprintf(stderr, "Failed to open %s\n", output.filename);
+			exit(1);
+		}
+	}
+
+	//r = rtlsdr_set_testmode(dongle.dev, 1);
+
+	/* Reset endpoint before we start reading from it (mandatory) */
+	verbose_reset_buffer(dongle.dev);
+
+	pthread_create(&controller.thread, NULL, controller_thread_fn, (void *)(&controller));
+	usleep(100000);
+	pthread_create(&output.thread, NULL, output_thread_fn, (void *)(&output));
+	pthread_create(&demod.thread, NULL, demod_thread_fn, (void *)(&demod));
+	pthread_create(&dongle.thread, NULL, dongle_thread_fn, (void *)(&dongle));
+
+	while (!do_exit) {
+		usleep(100000);
+	}
+
+	if (do_exit) {
+		fprintf(stderr, "\nUser cancel, exiting...\n");}
+	else {
+		fprintf(stderr, "\nLibrary error %d, exiting...\n", r);}
+
+	rtlsdr_cancel_async(dongle.dev);
+	pthread_join(dongle.thread, NULL);
+	safe_cond_signal(&demod.ready, &demod.ready_m);
+	pthread_join(demod.thread, NULL);
+	safe_cond_signal(&output.ready, &output.ready_m);
+	pthread_join(output.thread, NULL);
+	safe_cond_signal(&controller.hop, &controller.hop_m);
+	pthread_join(controller.thread, NULL);
+
+	//dongle_cleanup(&dongle);
+	demod_cleanup(&demod);
+	output_cleanup(&output);
+	controller_cleanup(&controller);
+
+	if (output.file != stdout) {
+		fclose(output.file);}
+
+	rtlsdr_close(dongle.dev);
+	return r >= 0 ? r : -r;
+}
+
+// vim: tabstop=8:softtabstop=8:shiftwidth=8:noexpandtab:colorscheme=darkblue
